@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mtg": {
+      "command": "/Users/jabelk/dev/projects/ai/mtg-mcp/.venv/bin/python",
+      "args": ["/Users/jabelk/dev/projects/ai/mtg-mcp/src/server.py"]
+    }
+  }
+}
