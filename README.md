@@ -1,182 +1,117 @@
-# README.md
+# mtg-mcp
 
-## Week 1 — Hobby Track: `mtg.card_lookup`
+A minimal Model Context Protocol server in Python that exposes Magic: The Gathering card lookups (and a health check) to any MCP-compatible LLM client.
 
-This is a minimal **MCP** server in Python that exposes two tools:
-
-- `health.check` — returns version, current time, and a simple learning streak counter stored in `streak.json`.
-- `mtg.card_lookup` — **Day 1** returns a fake response (proves wiring). On **Day 2**, switch to Scryfall API.
-
-### Quick start
-
-```bash
-python -m venv .venv
-source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install --upgrade pip
-pip install mcp uvloop (optional on Windows)
-
-# Run the server over stdio (default)
-python src/server.py
-```
-
-> If your client expects a command, point it at `python src/server.py`.
-
-### Files
-```
-/mcp-mtg-week1
-  ├─ src/
-  │   ├─ server.py            # MCP server entry point
-  │   └─ tools/
-  │       ├─ __init__.py
-  │       └─ card_lookup.py   # tool implementation (fake → real)
-  ├─ logs/
-  └─ streak.json              # created on first run
-```
-
-### Day 2 switch (Scryfall)
-- Replace the fake result in `card_lookup.lookup()` with a real HTTP call to Scryfall's named endpoint:
-  - `https://api.scryfall.com/cards/named?fuzzy=<name>`
-- Keep the same return schema.
+> **Companion to the blog post:** [Model Context Protocol Tutorial: Build Your First Server](https://sierracodeco.com/blog/mcp-tutorial-build-your-first-server/)
+>
+> The post walks through this repo end-to-end: what MCP is, how the two tools work, the Day-1-fake → Day-2-real Scryfall progression, and how to wire it up to Claude Desktop.
 
 ---
 
-# src/server.py
+## What it does
 
-import asyncio
-import json
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
+Two tools, exposed by one Python process over MCP stdio:
 
-try:
-    import uvloop  # type: ignore
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except Exception:
-    pass
+- **`health.check`** — returns the server version, current UTC time, and a simple "learning streak" counter persisted to `streak.json`. The simplest possible tool. No external dependencies.
+- **`mtg.card_lookup`** — takes a card name and returns the card's type line, oracle text, mana value, and image URL. Calls the [Scryfall fuzzy-named endpoint](https://scryfall.com/docs/api/cards/named).
 
-from mcp.server import Server
-from mcp.types import TextContent
+The contract on `mtg.card_lookup` was designed first; the implementation went through a deliberate fake → real progression. See [`docs/01-spec-scryfall-integration.md`](./docs/01-spec-scryfall-integration.md) for the full spec-driven write-up.
 
-from tools.card_lookup import lookup as mtg_lookup, FakeCardLookupError
+---
 
-APP_VERSION = "0.1.0"
-BASE_DIR = Path(__file__).resolve().parent.parent
-LOG_DIR = BASE_DIR / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-STREAK_FILE = BASE_DIR / "streak.json"
+## Quick start
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[
-        logging.FileHandler(LOG_DIR / "week1.log"),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger("mcp-mtg-week1")
+```bash
+git clone https://github.com/jabelk/mtg-mcp.git
+cd mtg-mcp
+python -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+pip install --upgrade pip
+pip install -r requirements.txt
+python src/server.py
+```
 
-server = Server("mcp-mtg-week1")
+The server runs over stdio by default and will block waiting for an MCP client to connect. That is correct — point your client at the command `python src/server.py` (with absolute paths) to start calling the tools.
 
+Python 3.11 or newer is recommended. `uvloop` is optional and skipped automatically on Windows.
 
-def _load_streak() -> int:
-    if STREAK_FILE.exists():
-        try:
-            data = json.loads(STREAK_FILE.read_text())
-            return int(data.get("streak_days", 0))
-        except Exception:
-            return 0
-    return 0
+---
 
+## Wiring it to Claude Desktop
 
-def _save_streak(days: int) -> None:
-    STREAK_FILE.write_text(json.dumps({"streak_days": days}, indent=2))
+Add an entry to your `claude_desktop_config.json`:
 
+| OS | Path |
+|----|------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
 
-@server.tool()
-async def health_check() -> dict:
-    """Return server version, current time (UTC), and learning streak days."""
-    now = datetime.now(timezone.utc).isoformat()
-    days = _load_streak()
-    # Nudge the counter once per run (simple Day-1 behavior)
-    _save_streak(days + 1)
-    payload = {"version": APP_VERSION, "now": now, "streak_days": days + 1}
-    logger.info("health.check -> %s", payload)
-    return payload
+```json
+{
+  "mcpServers": {
+    "mtg": {
+      "command": "/absolute/path/to/mtg-mcp/.venv/bin/python",
+      "args": ["/absolute/path/to/mtg-mcp/src/server.py"]
+    }
+  }
+}
+```
 
+Use absolute paths for both the interpreter and the script; Claude Desktop launches the server itself, so a `~` or relative path will not resolve. Quit Claude Desktop fully and reopen after saving.
 
-@server.tool()
-async def mtg_card_lookup(name: str) -> dict:
-    """Fuzzy-lookup a Magic card by name. Day-1: fake response to prove wiring."""
-    start = datetime.now(timezone.utc)
-    try:
-        result = await mtg_lookup(name=name)
-        logger.info("mtg.card_lookup name=%r -> ok", name)
-        return result
-    except FakeCardLookupError as e:
-        logger.warning("mtg.card_lookup name=%r -> not_found: %s", name, e)
-        return {
-            "error": "not_found",
-            "message": str(e),
-            "suggestion": "Try a different name or check spelling."
-        }
-    finally:
-        end = datetime.now(timezone.utc)
-        elapsed_ms = int((end - start).total_seconds() * 1000)
-        logger.info("mtg.card_lookup elapsed_ms=%d", elapsed_ms)
+---
 
+## Repository layout
 
-async def amain() -> None:
-    # Default transport: stdio
-    await server.run_stdio_async()
+```text
+mtg-mcp/
+├── src/
+│   ├── server.py            # MCP server entry point — registers the two tools
+│   └── tools/
+│       ├── __init__.py
+│       └── card_lookup.py   # Scryfall integration (Day-2 real implementation)
+├── docs/
+│   ├── 01-spec-scryfall-integration.md   # spec for the Day-1 → Day-2 swap
+│   ├── 02-plan-scryfall-integration.md   # implementation plan
+│   └── 03-lessons-learned.md             # retrospective
+├── requirements.txt
+├── LICENSE
+└── README.md
+```
 
+The `logs/` directory and `streak.json` are created at runtime.
 
-if __name__ == "__main__":
-    asyncio.run(amain())
+---
 
+## Day 1 → Day 2: how this repo evolved
 
-# src/tools/__init__.py
+The first version of `mtg.card_lookup` returned a hardcoded fake response (matching only the name `Atraxa`). The point of starting with a fake was to prove the wiring — that the MCP client could find the tool, call it, and parse the response shape — before debugging any HTTP layer.
 
-# Intentionally empty; makes tools a package.
+Once the wiring was confirmed, the same function was swapped to call Scryfall. The function signature, the input schema, and the return shape did not change. The contract held. That progression is the whole point of the companion blog post; the spec for the swap lives at [`docs/01-spec-scryfall-integration.md`](./docs/01-spec-scryfall-integration.md), the plan at [`docs/02-plan-scryfall-integration.md`](./docs/02-plan-scryfall-integration.md), and the retrospective at [`docs/03-lessons-learned.md`](./docs/03-lessons-learned.md).
 
+---
 
-# src/tools/card_lookup.py
+## Dependencies
 
-import asyncio
-from dataclasses import dataclass
+```text
+mcp        # the official MCP Python SDK
+uvloop     # faster event loop (skipped on Windows)
+httpx      # HTTP client for the Scryfall call
+```
 
+Versions are not pinned in this repo. If you need reproducibility, pin against your install.
 
-@dataclass
-class FakeCardLookupError(Exception):
-    query: str
-    def __str__(self) -> str:
-        return f"No fake match for query: {self.query}"
+---
 
+## License
 
-async def lookup(name: str) -> dict:
-    """
-    Day-1 fake implementation.
-    - Accepts any name containing 'atraxa' (case-insensitive) and returns a fixed object.
-    - Otherwise raises FakeCardLookupError so the server can return a friendly error.
+[MIT](./LICENSE) — Copyright (c) 2026 Jason Belk.
 
-    Day-2: replace this with a real HTTP call to Scryfall's `named?fuzzy=...` endpoint.
-    """
-    if not isinstance(name, str) or not name.strip():
-        raise FakeCardLookupError(query=name)
+---
 
-    await asyncio.sleep(0.05)  # small delay to exercise logging
+## Further reading
 
-    if "atraxa" in name.lower():
-        return {
-            "name": "Atraxa, Grand Unifier",
-            "type_line": "Legendary Creature — Phyrexian Angel",
-            "oracle_text": (
-                "Flying, vigilance, deathtouch, lifelink — When Atraxa, Grand Unifier "
-                "enters the battlefield, reveal the top ten cards of your library. For each "
-                "card type, you may put a card of that type from among them into your hand."
-            ),
-            "mana_value": 7,
-            "image_small": "https://cards.scryfall.io/small/front/5/9/59....jpg",
-            "rulings_uri": "https://api.scryfall.com/cards/xxxx/rulings"
-        }
-
-    raise FakeCardLookupError(query=name)
+- The companion post: [Model Context Protocol Tutorial: Build Your First Server](https://sierracodeco.com/blog/mcp-tutorial-build-your-first-server/)
+- Official MCP docs: [modelcontextprotocol.io](https://modelcontextprotocol.io)
+- Anthropic's MCP launch announcement: [anthropic.com/news/model-context-protocol](https://www.anthropic.com/news/model-context-protocol)
+- Scryfall API: [scryfall.com/docs/api](https://scryfall.com/docs/api)
